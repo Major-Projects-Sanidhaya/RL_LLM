@@ -1,240 +1,418 @@
-# File: data/dataset_loader.py
-
 """
-WHAT TO CODE:
-- Load HumanEval dataset
-- Parse problems and test cases
-- Provide prompts for RL environment
-- Evaluate code correctness (for rewards)
+Dataset Loader Module for RL-based Language Model Training
 
-HINTS:
-- Use datasets library from HuggingFace
-- Store problems in memory (only 164 problems)
-- Don't load any solutions - we're doing pure RL!
+This module provides three types of datasets for progressive reinforcement learning training:
+1. TinyDataset: 10 simple problems for initial debugging and verification
+2. SimpleMathDataset: Arithmetic problems for intermediate training
+3. CodeProblemDataset: HumanEval code generation problems for advanced training
+
+How it works:
+- Each dataset class provides methods to fetch problems and evaluate solutions
+- Problems are provided without reference solutions (pure RL approach)
+- Rewards are computed based on correctness (e.g., matching expected answers, passing tests)
+- The factory function create_dataset() instantiates the appropriate dataset type
+
+Implementation approach:
+- TinyDataset uses simple string matching for evaluation
+- SimpleMathDataset generates random arithmetic problems and validates numeric answers
+- CodeProblemDataset executes generated code against test cases (with timeout protection)
 """
 
-from datasets import load_dataset
 import random
+import re
+from datasets import load_dataset
+from typing import Dict, List, Tuple, Optional
+import sys
+from io import StringIO
+import signal
+from contextlib import contextmanager
 
-class CodeProblemDataset:
+
+class TimeoutException(Exception):
+    """Custom exception raised when code execution exceeds time limit"""
+    pass
+
+
+@contextmanager
+def time_limit(seconds):
     """
-    WHAT THIS DOES:
-    - Loads programming problems
-    - Provides random prompts for training
-    - Executes code to check correctness
+    Context manager for enforcing execution timeout
+
+    Args:
+        seconds: Maximum number of seconds to allow execution
+
+    Raises:
+        TimeoutException: If execution exceeds the time limit
+
+    Usage:
+        with time_limit(5):
+            # code that might take too long
+    """
+    def signal_handler(signum, frame):
+        raise TimeoutException("Timed out!")
+
+    # Set up alarm signal handler
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        # Always disable the alarm when done
+        signal.alarm(0)
+
+
+class TinyDataset:
+    """
+    Minimal dataset for initial debugging
+    10 simple problems to verify RL loop works
     """
     
-    def __init__(self, split='test', use_subset=None):
-        """
-        WHAT TO CODE:
-        - Load HumanEval from HuggingFace
-        - Extract only: task_id, prompt, test cases, entry_point
-        - Store in list for easy sampling
-        
-        HINTS:
-        - pip install datasets
-        - Use: load_dataset("openai_humaneval")
-        - use_subset: if not None, only use first N problems for faster iteration
-        
-        EXAMPLE PROBLEM STRUCTURE:
-        {
-            'task_id': 'HumanEval/0',
-            'prompt': 'def has_close_elements(numbers: List[float], threshold: float) -> bool:\n """  
-        """ Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    ...',
-            'canonical_solution': '...',  # DON'T USE THIS - we're doing RL!
-            'test': 'def check(candidate):\n    assert candidate(...) == ...',
-            'entry_point': 'has_close_elements'
-        }
-        """
-        
-        # TODO: Load dataset
-        # dataset = load_dataset("openai_humaneval", split="test")
-        
-        # TODO: Extract only what we need
-        # self.problems = []
-        # for example in dataset:
-        #     problem = {
-        #         'task_id': example['task_id'],
-        #         'prompt': example['prompt'],
-        #         'test': example['test'],
-        #         'entry_point': example['entry_point']
-        #     }
-        #     self.problems.append(problem)
-        
-        # TODO: If use_subset specified, only keep first N
-        # if use_subset:
-        #     self.problems = self.problems[:use_subset]
-        
-        pass
+    def __init__(self):
+        self.problems = [
+            {'prompt': 'Continue: Hello', 'answer': 'world', 'task_id': 'tiny_0'},
+            {'prompt': 'Continue: Good', 'answer': 'morning', 'task_id': 'tiny_1'},
+            {'prompt': 'What is 2+2? Answer:', 'answer': '4', 'task_id': 'tiny_2'},
+            {'prompt': 'What is 3+5? Answer:', 'answer': '8', 'task_id': 'tiny_3'},
+            {'prompt': 'Complete: The sky is', 'answer': 'blue', 'task_id': 'tiny_4'},
+            {'prompt': 'What is 10-3? Answer:', 'answer': '7', 'task_id': 'tiny_5'},
+            {'prompt': 'Continue: Thank', 'answer': 'you', 'task_id': 'tiny_6'},
+            {'prompt': 'What is 5+5? Answer:', 'answer': '10', 'task_id': 'tiny_7'},
+            {'prompt': 'Complete: Python is a', 'answer': 'language', 'task_id': 'tiny_8'},
+            {'prompt': 'What is 1+1? Answer:', 'answer': '2', 'task_id': 'tiny_9'},
+        ]
     
-    def get_random_problem(self):
+    def get_random_problem(self) -> Dict:
         """
-        WHAT TO CODE:
-        - Return a random problem for training
-        
-        HINTS:
-        - Use random.choice(self.problems)
-        - Return the full problem dict
+        Sample a random problem from the dataset
+
+        Returns:
+            Dict with keys: 'prompt', 'answer', 'task_id'
         """
-        pass
-    
-    def get_problem_by_id(self, task_id):
+        return random.choice(self.problems)
+
+    def get_problem_by_id(self, task_id: str) -> Optional[Dict]:
         """
-        WHAT TO CODE:
-        - Return specific problem by task_id
-        - Useful for evaluation
-        
-        HINTS:
-        - Search through self.problems
-        - Return problem where problem['task_id'] == task_id
+        Retrieve a specific problem by its task_id
+
+        Args:
+            task_id: Unique identifier for the problem
+
+        Returns:
+            Problem dict if found, None otherwise
         """
-        pass
-    
-    def evaluate_code(self, code, problem):
+        for p in self.problems:
+            if p['task_id'] == task_id:
+                return p
+        return None
+
+    def evaluate_answer(self, generated_text: str, problem: Dict) -> bool:
         """
-        WHAT TO CODE:
-        - Execute the generated code
-        - Run test cases
-        - Return (passed, total_tests, error_message)
-        
-        HINTS:
-        - This is tricky - need to execute code safely
-        - Use exec() with timeout
-        - Catch exceptions
-        - Return tuple: (num_passed, num_total)
-        
-        IMPORTANT SAFETY:
-        - DON'T run untrusted code directly in production
-        - For research: ok with subprocess timeout
-        - For deployment: use Docker containers
+        Check if the generated answer is correct
+
+        Uses simple substring matching after normalizing to lowercase.
+
+        Args:
+            generated_text: The text generated by the model
+            problem: The problem dict containing the correct answer
+
+        Returns:
+            True if answer is correct, False otherwise
         """
-        
-        # TODO: Combine generated code with test code
-        # full_code = code + '\n' + problem['test'] + '\n' + f"check({problem['entry_point']})"
-        
-        # TODO: Try to execute
-        # try:
-        #     exec(full_code, {})
-        #     return (True, 1, None)  # Success
-        # except Exception as e:
-        #     return (False, 0, str(e))  # Failed
-        
-        pass
-    
-    def compute_reward(self, code, problem):
+        generated_text = generated_text.lower().strip()
+        correct_answer = problem['answer'].lower().strip()
+
+        # Check if answer appears in generated text
+        return correct_answer in generated_text
+
+    def compute_reward(self, generated_text: str, problem: Dict) -> float:
         """
-        WHAT TO CODE:
-        - Wrapper around evaluate_code
-        - Convert test results to reward signal
-        
-        HINTS:
-        - If code passes: reward = +10
-        - If code fails: reward = -1
-        - If syntax error: reward = -5
-        - Can add partial credit later
+        Convert evaluation result to a numerical reward
+
+        Args:
+            generated_text: The text generated by the model
+            problem: The problem dict containing the correct answer
+
+        Returns:
+            +10.0 for correct answer, -1.0 for incorrect
         """
-        
-        # TODO: Evaluate code
-        # passed, total, error = self.evaluate_code(code, problem)
-        
-        # TODO: Assign rewards
-        # if passed:
-        #     return 10.0
-        # elif error and "SyntaxError" in error:
-        #     return -5.0
-        # else:
-        #     return -1.0
-        
-        pass
+        if self.evaluate_answer(generated_text, problem):
+            return 10.0
+        return -1.0
     
     def __len__(self):
-        """Return number of problems"""
         return len(self.problems)
     
     def __getitem__(self, idx):
-        """Get problem by index"""
         return self.problems[idx]
 
 
-# ============================================
-# SIMPLER ALTERNATIVE: Use Simple Math Problems First
-# ============================================
-
 class SimpleMathDataset:
     """
-    WHAT THIS DOES:
-    - Generate simple arithmetic problems
-    - Much easier to start with than code
-    - Good for debugging your RL setup
-    
-    USE THIS FIRST to test your RL implementation!
+    Simple arithmetic problems for RL training
+    Good intermediate step before code generation
+
+    Generates random addition, subtraction, and multiplication problems.
     """
-    
-    def __init__(self, num_problems=1000):
+
+    def __init__(self, num_problems: int = 1000, max_num: int = 20):
         """
-        WHAT TO CODE:
-        - Generate random math problems
-        - Store them in memory
-        
-        HINTS:
-        - Problems like: "What is 5 + 3?"
-        - Answer: "8"
-        - Easy to evaluate!
+        Initialize dataset with randomly generated math problems
+
+        Args:
+            num_problems: Number of problems to generate
+            max_num: Maximum number to use in operations (for addition/subtraction)
         """
-        
-        # TODO: Generate problems
-        # self.problems = []
-        # for i in range(num_problems):
-        #     a = random.randint(1, 20)
-        #     b = random.randint(1, 20)
-        #     problem = {
-        #         'prompt': f"What is {a} + {b}? Answer:",
-        #         'answer': str(a + b),
-        #         'task_id': f'math_{i}'
-        #     }
-        #     self.problems.append(problem)
-        
-        pass
+        self.problems = []
+        self.max_num = max_num
+
+        # Generate random problems
+        for i in range(num_problems):
+            a = random.randint(1, max_num)
+            b = random.randint(1, max_num)
+
+            # Random operation: addition, subtraction, or multiplication
+            op = random.choice(['+', '-', '*'])
+
+            if op == '+':
+                answer = a + b
+                question = f"What is {a} + {b}?"
+            elif op == '-':
+                # Ensure non-negative results
+                if a < b:
+                    a, b = b, a
+                answer = a - b
+                question = f"What is {a} - {b}?"
+            else:  # multiplication
+                # Use smaller numbers for multiplication to keep answers manageable
+                a = random.randint(1, 10)
+                b = random.randint(1, 10)
+                answer = a * b
+                question = f"What is {a} × {b}?"
+
+            # Store problem with all metadata
+            problem = {
+                'prompt': f"{question} Answer:",
+                'answer': str(answer),
+                'task_id': f'math_{i}',
+                'question': question
+            }
+            self.problems.append(problem)
     
-    def get_random_problem(self):
-        """Return random math problem"""
+    def get_random_problem(self) -> Dict:
+        """Sample a random math problem"""
         return random.choice(self.problems)
+
+    def get_problem_by_id(self, task_id: str) -> Optional[Dict]:
+        """Retrieve a specific problem by its task_id"""
+        for p in self.problems:
+            if p['task_id'] == task_id:
+                return p
+        return None
+
+    def evaluate_answer(self, generated_text: str, problem: Dict) -> bool:
+        """
+        Extract numeric answer from generated text and check correctness
+
+        Uses regex to find all numbers in the generated text, then compares
+        the first number found with the correct answer.
+
+        Args:
+            generated_text: The text generated by the model
+            problem: The problem dict containing the correct answer
+
+        Returns:
+            True if the first number in generated text matches correct answer
+        """
+        # Extract all numbers from generated text (including negative)
+        numbers = re.findall(r'-?\d+', generated_text)
+
+        if not numbers:
+            return False
+
+        # Check if first number found matches the correct answer
+        try:
+            extracted_answer = numbers[0]
+            return extracted_answer == problem['answer']
+        except:
+            return False
+
+    def compute_reward(self, generated_text: str, problem: Dict) -> float:
+        """
+        Compute reward based on correctness
+
+        Args:
+            generated_text: The text generated by the model
+            problem: The problem dict
+
+        Returns:
+            +10.0 for correct answer, -1.0 for incorrect
+        """
+        if self.evaluate_answer(generated_text, problem):
+            return 10.0
+        return -1.0
     
-    def evaluate_answer(self, generated_text, problem):
-        """
-        WHAT TO CODE:
-        - Extract answer from generated text
-        - Compare with correct answer
-        - Return True/False
-        
-        HINTS:
-        - Generated might be: "The answer is 8" or just "8"
-        - Use string matching or regex
-        - Be lenient in parsing
-        """
-        
-        # TODO: Extract number from generated_text
-        # import re
-        # numbers = re.findall(r'\d+', generated_text)
-        # if numbers and numbers[0] == problem['answer']:
-        #     return True
-        # return False
-        
-        pass
+    def __len__(self):
+        return len(self.problems)
     
-    def compute_reward(self, generated_text, problem):
+    def __getitem__(self, idx):
+        return self.problems[idx]
+
+
+class CodeProblemDataset:
+    """
+    HumanEval dataset for code generation
+    More challenging - use after math dataset works
+
+    Loads programming problems from the HumanEval benchmark and evaluates
+    generated code by executing it against test cases.
+    """
+
+    def __init__(self, split: str = 'test', use_subset: Optional[int] = None):
         """
-        WHAT TO CODE:
-        - Convert evaluation to reward
-        
-        HINTS:
-        - Correct: +10
-        - Wrong: -1
+        Initialize dataset by loading HumanEval from HuggingFace
+
+        Args:
+            split: Dataset split to use (default: 'test')
+            use_subset: If specified, only use first N problems for faster experimentation
         """
-        
-        # TODO: Evaluate and return reward
-        # if self.evaluate_answer(generated_text, problem):
-        #     return 10.0
-        # return -1.0
-        
-        pass
+        print("Loading HumanEval dataset...")
+        try:
+            dataset = load_dataset("openai_humaneval", split=split)
+        except:
+            print("Error loading HumanEval. Make sure you have internet connection.")
+            print("Run: pip install datasets")
+            dataset = []
+
+        # Extract relevant fields from each problem
+        self.problems = []
+        for example in dataset:
+            problem = {
+                'task_id': example['task_id'],
+                'prompt': example['prompt'],  # Function signature and docstring
+                'test': example['test'],  # Test cases to run
+                'entry_point': example['entry_point']  # Function name to test
+            }
+            self.problems.append(problem)
+
+        # Optionally use only a subset for faster iteration during development
+        if use_subset is not None:
+            self.problems = self.problems[:use_subset]
+
+        print(f"Loaded {len(self.problems)} code problems")
+    
+    def get_random_problem(self) -> Dict:
+        """Sample a random code problem"""
+        return random.choice(self.problems)
+
+    def get_problem_by_id(self, task_id: str) -> Optional[Dict]:
+        """Retrieve a specific problem by its task_id"""
+        for p in self.problems:
+            if p['task_id'] == task_id:
+                return p
+        return None
+
+    def evaluate_code(self, code: str, problem: Dict) -> Tuple[bool, int, Optional[str]]:
+        """
+        Execute generated code and run tests to check correctness
+
+        WARNING: This executes untrusted code! Only use for research purposes
+        with proper isolation (e.g., in a sandboxed environment or container).
+
+        Implementation:
+        1. Combines generated code with test cases from the problem
+        2. Executes the combined code using Python's exec()
+        3. Captures stdout/stderr to prevent clutter
+        4. Enforces a 5-second timeout to prevent infinite loops
+        5. Returns pass/fail status and any error messages
+
+        Args:
+            code: The generated Python code to evaluate
+            problem: Problem dict containing test cases and entry point
+
+        Returns:
+            Tuple of (passed: bool, num_tests: int, error_message: Optional[str])
+        """
+        try:
+            # Combine generated code with test cases
+            full_code = code + '\n\n' + problem['test'] + '\n\n'
+            full_code += f"check({problem['entry_point']})\n"
+
+            # Execute with timeout protection
+            with time_limit(5):
+                # Capture stdout/stderr to avoid cluttering output
+                old_stdout = sys.stdout
+                old_stderr = sys.stderr
+                redirected_output = StringIO()
+                sys.stdout = redirected_output
+                sys.stderr = redirected_output
+
+                try:
+                    # Execute the code in isolated namespace
+                    exec(full_code, {})
+                    # Restore output streams
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+                    return (True, 1, None)  # Tests passed
+                except Exception as e:
+                    # Restore output streams
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+                    return (False, 0, str(e))  # Tests failed with error
+
+        except TimeoutException:
+            return (False, 0, "Timeout")
+        except Exception as e:
+            return (False, 0, str(e))
+
+    def compute_reward(self, code: str, problem: Dict) -> float:
+        """
+        Compute reward from code execution results
+
+        Reward structure:
+        - +10.0: All tests passed
+        - -5.0: Syntax error (severely malformed code)
+        - -3.0: Timeout (infinite loop or very slow code)
+        - -1.0: Other errors (wrong logic, runtime errors, etc.)
+
+        Args:
+            code: The generated Python code
+            problem: Problem dict
+
+        Returns:
+            Numerical reward signal
+        """
+        passed, total, error = self.evaluate_code(code, problem)
+
+        if passed:
+            return 10.0
+        elif error and "SyntaxError" in str(error):
+            return -5.0  # Worse penalty for syntax errors
+        elif error and "Timeout" in str(error):
+            return -3.0  # Moderate penalty for timeout
+        else:
+            return -1.0  # Small penalty for logic/runtime errors
+    
+    def __len__(self):
+        return len(self.problems)
+    
+    def __getitem__(self, idx):
+        return self.problems[idx]
+
+
+# Factory function
+def create_dataset(dataset_type: str = 'tiny', **kwargs):
+    """
+    Factory function to create datasets
+    
+    Args:
+        dataset_type: 'tiny', 'math', or 'code'
+        **kwargs: passed to dataset constructor
+    """
+    if dataset_type == 'tiny':
+        return TinyDataset()
+    elif dataset_type == 'math':
+        return SimpleMathDataset(**kwargs)
+    elif dataset_type == 'code':
+        return CodeProblemDataset(**kwargs)
+    else:
+        raise ValueError(f"Unknown dataset type: {dataset_type}")

@@ -1,64 +1,142 @@
-# File: environments/text_generation_env.py
+"""
+Text Generation Environment Module
+
+This module implements a gym-style RL environment for autoregressive text generation.
+The agent generates text one token at a time, receiving rewards based on fluency.
+
+How it works:
+- Environment maintains current token sequence as state
+- Agent selects next token as action (from vocabulary)
+- Reward is computed using reward_fn (typically based on fluency)
+- Episode terminates when max_length is reached or EOS token is generated
+
+Implementation approach:
+- State: Dictionary containing current token sequence, step count, and done flag
+- Action: Integer token ID to append to sequence
+- Reward: Small negative per step (brevity), large positive/negative at end (fluency)
+- Follows standard RL interface: reset() and step(action) -> (state, reward, done, info)
+"""
+
+import torch
+from typing import Dict, Tuple, Any, Optional
+
 
 class TextGenerationEnvironment:
     """
-    WHAT TO CODE:
-    - Initialize with tokenizer (use GPT2Tokenizer from transformers)
-    - Track current sequence of tokens
-    - Define max_length (start with 50 tokens)
-    - Store the prompt/context
-    
-    HINTS:
-    - Use a list to store current_sequence
-    - Keep track of step_count
-    - Define done flag for episode termination
+    Reinforcement learning environment for autoregressive text generation
+
+    Implements gym-style interface for token-by-token text generation.
     """
+
+    def __init__(self, tokenizer, reward_fn, max_length: int = 50):
+        """
+        Initialize text generation environment
+
+        Args:
+            tokenizer: HuggingFace tokenizer for encoding/decoding text
+            reward_fn: Reward function to evaluate generated sequences
+            max_length: Maximum number of tokens to generate before episode ends
+        """
+        self.tokenizer = tokenizer
+        self.reward_fn = reward_fn
+        self.max_length = max_length
+
+        # Episode state variables
+        self.current_sequence = []  # List of token IDs generated so far
+        self.step_count = 0  # Number of tokens generated in current episode
+        self.done = False  # Whether episode has terminated
+
+        # Special tokens
+        self.eos_token_id = tokenizer.eos_token_id
     
-    def __init__(self, tokenizer, max_length, reward_fn):
-        # TODO: Initialize tokenizer
-        # TODO: Set max_length
-        # TODO: Store reward_fn for later use
-        # TODO: Initialize empty current_sequence list
-        # TODO: Set step_count = 0
-        pass
-    
-    def reset(self, prompt_text):
+    def reset(self, prompt_text: str) -> Dict:
         """
-        WHAT TO CODE:
-        - Convert prompt_text to token IDs using tokenizer
-        - Set current_sequence to these initial tokens
-        - Reset step_count to 0
-        - Return initial state
-        
-        HINTS:
-        - State should be a dictionary with:
-          {'token_ids': current_sequence, 'step': step_count}
-        - Use tokenizer.encode(prompt_text, return_tensors='pt')
+        Reset environment with new prompt to start a fresh episode
+
+        Args:
+            prompt_text: Initial prompt as string (e.g., "Once upon a time")
+
+        Returns:
+            Initial state dictionary containing token_ids, step count, and done flag
         """
-        pass
-    
-    def step(self, action):
+        # Tokenize the prompt text into token IDs
+        token_ids = self.tokenizer.encode(prompt_text, return_tensors='pt')[0]
+
+        # Initialize episode state
+        self.current_sequence = token_ids.tolist()
+        self.step_count = 0
+        self.done = False
+
+        return self.get_state()
+
+    def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
         """
-        WHAT TO CODE:
-        - Append action (token_id) to current_sequence
-        - Increment step_count
-        - Compute reward using reward_fn
-        - Check if episode is done (max_length or EOS token)
-        - Return (next_state, reward, done, info)
-        
-        HINTS:
-        - action is an integer (token ID from 0 to vocab_size-1)
-        - done = (step_count >= max_length) or (action == eos_token_id)
-        - info dict can contain decoded text for debugging
+        Take a step in the environment by appending a token
+
+        This is the core RL interaction: agent chooses action (token),
+        environment returns next state, reward, and whether episode is done.
+
+        Args:
+            action: Token ID to append to current sequence
+
+        Returns:
+            Tuple of (next_state, reward, done, info):
+            - next_state: Dictionary with updated token sequence
+            - reward: Float reward signal for this step
+            - done: Boolean indicating if episode has terminated
+            - info: Additional information (decoded text, length, etc.)
         """
-        pass
-    
-    def get_state(self):
+        # Append the chosen token to sequence
+        self.current_sequence.append(action)
+        self.step_count += 1
+
+        # Check termination conditions
+        self.done = (
+            self.step_count >= self.max_length or  # Hit max length
+            action == self.eos_token_id  # Generated end-of-sequence token
+        )
+
+        # Compute reward
+        if self.done:
+            # Episode finished - compute final reward based on complete sequence
+            token_tensor = torch.tensor(self.current_sequence)
+            reward = self.reward_fn.compute_reward(token_tensor)
+        else:
+            # Step reward: small negative to encourage brevity (shorter generations)
+            reward = -0.01
+
+        # Get next state
+        next_state = self.get_state()
+
+        # Additional info for debugging/logging
+        info = {
+            'text': self.tokenizer.decode(self.current_sequence),
+            'length': len(self.current_sequence)
+        }
+
+        return next_state, reward, self.done, info
+
+    def get_state(self) -> Dict:
         """
-        WHAT TO CODE:
-        - Return current state as dictionary
-        
-        HINTS:
-        - Include token_ids, step_count, and maybe text for debugging
+        Get current environment state
+
+        Returns:
+            Dictionary with:
+            - token_ids: Tensor of current token sequence
+            - step: Number of generation steps taken
+            - done: Whether episode is finished
         """
-        pass
+        return {
+            'token_ids': torch.tensor(self.current_sequence),
+            'step': self.step_count,
+            'done': self.done
+        }
+
+    def decode_sequence(self) -> str:
+        """
+        Decode current token sequence to human-readable text
+
+        Returns:
+            String representation of current sequence
+        """
+        return self.tokenizer.decode(self.current_sequence)
