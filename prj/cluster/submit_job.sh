@@ -1,16 +1,14 @@
 #!/bin/bash
-#!/bin/bash
 #SBATCH --job-name=rl-llm-train
 #SBATCH --output=logs/output_%j.txt
 #SBATCH --error=logs/error_%j.txt
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gpu=1
+#SBATCH --gpus-per-node=1          # Gilbreth GPU specification
 #SBATCH --mem=32GB
 #SBATCH --time=4:00:00
-#SBATCH --partition=gpu
-#SBATCH --account=<your-account>   # CHANGE THIS to your Gilbreth account
+#SBATCH --account=standby          # CHANGE THIS to your allocation (e.g., gpu, standby, etc.)
 
 # Print job info
 echo "Job ID: $SLURM_JOB_ID"
@@ -33,10 +31,10 @@ nvidia-smi
 mkdir -p logs
 mkdir -p checkpoints
 
-# Run training
+# Run training - Week 6 Hierarchical Model
 echo ""
-echo "Starting training..."
-python main.py
+echo "Starting hierarchical training on Q&A task..."
+python train_hierarchical.py --task qa --iterations 200 --episodes 10
 
 echo ""
 echo "Job completed at: $(date)"

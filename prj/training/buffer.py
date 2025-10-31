@@ -31,7 +31,7 @@ class RolloutBuffer:
     
     def __init__(self):
         self.clear()
-    
+
     def clear(self):
         """Clear all stored data"""
         self.states = []
@@ -40,9 +40,21 @@ class RolloutBuffer:
         self.log_probs = []
         self.values = []
         self.dones = []
-    
-    def add(self, state, action, reward, log_prob, value, done):
-        """Add single transition"""
+        self.intentions = []  # For hierarchical policy (Week 6)
+
+    def add(self, state, action, reward, log_prob, value, done, intention=None):
+        """
+        Add single transition
+
+        Args:
+            state: State dictionary with token_ids
+            action: Action taken
+            reward: Reward received
+            log_prob: Log probability of action
+            value: Value estimate
+            done: Whether episode ended
+            intention: Optional intention vector for hierarchical policy (Week 6)
+        """
         # Store token_ids from state
         self.states.append(state['token_ids'])
         self.actions.append(action)
@@ -50,6 +62,10 @@ class RolloutBuffer:
         self.log_probs.append(log_prob)
         self.values.append(value)
         self.dones.append(done)
+
+        # Store intention if provided (for hierarchical policy)
+        if intention is not None:
+            self.intentions.append(intention)
     
     def get_batches(self, gamma=0.99, gae_lambda=0.95):
         """
@@ -95,13 +111,19 @@ class RolloutBuffer:
                 s_padded = s
             padded_states.append(s_padded)
         
-        return {
+        batch = {
             'states': torch.stack(padded_states),
             'actions': torch.tensor(self.actions, dtype=torch.long),
             'log_probs': torch.tensor(self.log_probs, dtype=torch.float32),
             'returns': torch.tensor(returns, dtype=torch.float32),
             'advantages': torch.tensor(advantages, dtype=torch.float32),
         }
+
+        # Add intentions if they were collected (for hierarchical policy)
+        if len(self.intentions) > 0:
+            batch['intentions'] = torch.stack(self.intentions)
+
+        return batch
     
     def __len__(self):
         return len(self.rewards)

@@ -100,16 +100,143 @@ class SimpleRewardFunction:
 
 class MultiComponentReward:
     """
-    Reward function with multiple components
+    Reward function with multiple components (Week 5 Implementation)
 
     Combines multiple reward signals for more sophisticated training.
-    Currently includes fluency + length penalty, but can be extended
-    with diversity rewards, task-specific metrics, etc.
+    Implements the four key components from the research plan:
+    - Fluency: How natural does the text sound?
+    - Coherence: Does the text make logical sense?
+    - Task Completion: Does it accomplish the intended goal?
+    - Safety: Is the content appropriate and non-harmful?
     """
 
-    def __init__(self):
-        """Initialize multi-component reward with fluency scorer"""
+    def __init__(self, tokenizer=None, task_evaluator=None):
+        """
+        Initialize multi-component reward with fluency scorer
+
+        Args:
+            tokenizer: Tokenizer for decoding text
+            task_evaluator: Optional task-specific evaluator function
+        """
         self.fluency_reward = SimpleRewardFunction()
+        self.tokenizer = tokenizer
+        self.task_evaluator = task_evaluator
+
+        # Unsafe words/patterns for safety check
+        self.unsafe_patterns = [
+            'kill', 'hate', 'violence', 'attack', 'bomb', 'weapon',
+            'racist', 'sexist', 'discriminat'
+        ]
+
+    def compute_fluency(self, token_ids: torch.Tensor) -> float:
+        """
+        Compute fluency reward using language model perplexity
+
+        Returns:
+            Float reward for fluency (higher = more fluent)
+        """
+        return self.fluency_reward.compute_reward(token_ids)
+
+    def compute_coherence(self, token_ids: torch.Tensor, text: str = None) -> float:
+        """
+        Compute coherence reward based on text structure
+
+        Coherence measures whether the text makes logical sense:
+        - Repetition penalty: Penalize repeated tokens
+        - Length consistency: Ensure reasonable length
+        - Token diversity: Reward diverse vocabulary usage
+
+        Args:
+            token_ids: Tensor of token IDs
+            text: Decoded text (optional, will decode if not provided)
+
+        Returns:
+            Float reward for coherence
+        """
+        if len(token_ids) < 2:
+            return 0.0
+
+        # Check for excessive repetition
+        token_list = token_ids.tolist() if torch.is_tensor(token_ids) else token_ids
+        unique_tokens = len(set(token_list))
+        total_tokens = len(token_list)
+
+        # Diversity ratio (higher is better)
+        diversity_ratio = unique_tokens / total_tokens if total_tokens > 0 else 0.0
+
+        # Reward diversity, penalize repetition
+        coherence_score = diversity_ratio * 0.2
+
+        # Check for immediate repetition (same token repeated)
+        immediate_repeats = sum(1 for i in range(len(token_list) - 1)
+                               if token_list[i] == token_list[i+1])
+        repetition_penalty = -0.05 * immediate_repeats
+
+        return coherence_score + repetition_penalty
+
+    def compute_task_completion(self, token_ids: torch.Tensor, text: str = None,
+                                prompt: str = None, target: str = None) -> float:
+        """
+        Compute task completion reward
+
+        Evaluates whether the generated text accomplishes the intended goal.
+        Can use custom task evaluator or basic heuristics.
+
+        Args:
+            token_ids: Tensor of token IDs
+            text: Decoded generated text
+            prompt: Original prompt/question
+            target: Expected answer/output (if available)
+
+        Returns:
+            Float reward for task completion
+        """
+        # If custom task evaluator provided, use it
+        if self.task_evaluator is not None:
+            return self.task_evaluator(text, prompt, target)
+
+        # Basic heuristic: reasonable length and ends properly
+        score = 0.0
+
+        # Reward appropriate length (not too short, not too long)
+        length = len(token_ids)
+        if 5 <= length <= 100:
+            score += 0.1
+        elif length < 5:
+            score -= 0.2  # Too short
+        elif length > 200:
+            score -= 0.1  # Too long
+
+        return score
+
+    def compute_safety(self, token_ids: torch.Tensor, text: str = None) -> float:
+        """
+        Compute safety reward
+
+        Penalizes unsafe, harmful, or inappropriate content.
+
+        Args:
+            token_ids: Tensor of token IDs
+            text: Decoded text (will decode if not provided)
+
+        Returns:
+            Float reward for safety (0 if safe, negative if unsafe)
+        """
+        # Decode text if not provided
+        if text is None and self.tokenizer is not None:
+            text = self.tokenizer.decode(token_ids)
+
+        if text is None:
+            return 0.0  # Can't evaluate without text
+
+        text_lower = text.lower()
+
+        # Check for unsafe patterns
+        for pattern in self.unsafe_patterns:
+            if pattern in text_lower:
+                return -1.0  # Strong penalty for unsafe content
+
+        return 0.0  # No safety issues detected
 
     def compute_length_penalty(self, token_ids: torch.Tensor, target_length: int = 20) -> float:
         """
@@ -130,25 +257,50 @@ class MultiComponentReward:
         # Linear penalty: -0.01 per token away from target
         return -0.01 * diff
 
-    def compute_reward(self, token_ids: torch.Tensor) -> float:
+    def compute_reward(self, token_ids: torch.Tensor, text: str = None,
+                      prompt: str = None, target: str = None) -> float:
         """
-        Combine multiple reward components into single reward signal
+        Combine multiple reward components into single reward signal (Week 5)
 
-        Current components:
-        - Fluency reward (from GPT-2 perplexity)
-        - Length penalty (encourages appropriate length)
+        Implements the four core components:
+        1. Fluency: How natural does the text sound?
+        2. Coherence: Does the text make logical sense?
+        3. Task Completion: Does it accomplish the intended goal?
+        4. Safety: Is the content appropriate and non-harmful?
 
         Args:
             token_ids: Tensor of token IDs
+            text: Decoded text (optional)
+            prompt: Original prompt (optional, for task completion)
+            target: Target answer (optional, for task completion)
 
         Returns:
             Combined reward score
         """
-        # Get individual components
-        fluency = self.fluency_reward.compute_reward(token_ids)
-        length_penalty = self.compute_length_penalty(token_ids)
+        # Decode text if needed and tokenizer available
+        if text is None and self.tokenizer is not None:
+            text = self.tokenizer.decode(token_ids)
 
-        # Weighted combination (currently equal weights)
-        total_reward = fluency + length_penalty
+        # Get individual components
+        fluency = self.compute_fluency(token_ids)
+        coherence = self.compute_coherence(token_ids, text)
+        task_completion = self.compute_task_completion(token_ids, text, prompt, target)
+        safety = self.compute_safety(token_ids, text)
+
+        # Weighted combination
+        # Safety is critical (can veto entire output)
+        # Fluency is most important for language quality
+        # Coherence ensures logical consistency
+        # Task completion ensures usefulness
+        total_reward = (
+            0.4 * fluency +
+            0.2 * coherence +
+            0.3 * task_completion +
+            0.1 * safety
+        )
+
+        # If safety is negative, apply strong penalty
+        if safety < 0:
+            total_reward += safety * 5.0  # Amplify safety penalty
 
         return total_reward
