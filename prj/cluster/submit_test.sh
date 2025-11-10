@@ -4,11 +4,12 @@
 #SBATCH --error=logs/test_error_%j.txt
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=20
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=16GB
 #SBATCH --time=0:30:00
-#SBATCH --account=standby          # CHANGE THIS to your allocation
+#SBATCH --partition=v100
+#SBATCH --account=pfw-cs
 
 # Print job info
 echo "========================================"
@@ -33,7 +34,13 @@ nvidia-smi
 echo ""
 
 # Navigate to project directory
-cd $SLURM_SUBMIT_DIR
+cd $SLURM_SUBMIT_DIR/..
+
+# Print current directory for debugging
+echo "Current directory: $(pwd)"
+echo "Files available:"
+ls -la test_week6_milestone.py 2>/dev/null || echo "test_week6_milestone.py not found"
+echo ""
 
 # Run comprehensive tests
 echo "Running Week 5-6 milestone tests..."
