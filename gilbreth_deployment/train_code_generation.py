@@ -30,9 +30,9 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='humaneval',
                        choices=['humaneval', 'stack', 'codechain', 'redpajama'],
                        help='Dataset to use for training')
-    parser.add_argument('--num_iterations', type=int, default=1000,
+    parser.add_argument('--num_iterations', type=int, default=8000,
                        help='Number of training iterations')
-    parser.add_argument('--episodes_per_iter', type=int, default=5,
+    parser.add_argument('--episodes_per_iter', type=int, default=6,
                        help='Number of episodes per iteration')
     parser.add_argument('--max_length', type=int, default=512,
                        help='Maximum sequence length')
@@ -304,7 +304,12 @@ class HierarchicalPolicy(nn.Module):
         pooled = state_encoding.mean(dim=1)
         mean = self.intention_mean(pooled)
         logstd = self.intention_logstd(pooled)
+        
+        logstd = torch.clamp(logstd, min=-20, max=2)
         std = torch.exp(logstd)
+
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        std = torch.nan_to_num(std, nan=1e-6, posinf=1.0, neginf=1e-6)
         dist = torch.distributions.Normal(mean, std)
         intention = dist.rsample()
         return intention, dist
