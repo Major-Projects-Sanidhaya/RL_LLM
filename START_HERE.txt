@@ -1,0 +1,124 @@
+================================================================================
+RL-LLM GILBRETH DEPLOYMENT PACKAGE
+================================================================================
+
+Welcome! This package contains everything you need to run your RL-LLM code
+generation training on Purdue's Gilbreth cluster.
+
+================================================================================
+QUICK START (5 MINUTES)
+================================================================================
+
+1. Read QUICKSTART.md for step-by-step instructions
+2. Upload files: bash upload_to_gilbreth.sh <your-username>
+3. SSH to Gilbreth and run setup (first time only)
+4. Submit training job: sbatch submit_training.sh
+5. Monitor progress: bash monitor_training.sh <job_id>
+6. Download results: bash download_results.sh <your-username>
+
+================================================================================
+DOCUMENTATION
+================================================================================
+
+📄 QUICKSTART.md          - 5-minute guide (START HERE!)
+📄 README.md              - Comprehensive documentation
+📄 DEPLOYMENT_SUMMARY.md  - Package overview
+
+================================================================================
+FILES IN THIS PACKAGE
+================================================================================
+
+CORE:
+  • train_code_generation.py   - Main training script (from your notebook)
+  • setup_gilbreth.sh          - Environment setup (run once)
+
+JOB SUBMISSION:
+  • submit_training.sh         - Standard GPU training job
+  • submit_training_a100.sh    - A100 GPU training job (faster)
+
+UTILITIES:
+  • upload_to_gilbreth.sh     - Upload code to Gilbreth (run locally)
+  • download_results.sh        - Download results (run locally)
+  • monitor_training.sh        - Monitor job progress
+  • check_gpu.sh              - Check GPU availability
+
+================================================================================
+FIRST TIME SETUP
+================================================================================
+
+On LOCAL machine:
+  cd C:\Users\shars11\Documents\RL_LLM\gilbreth_deployment
+  bash upload_to_gilbreth.sh <username>
+
+On GILBRETH:
+  ssh <username>@gilbreth.rcac.purdue.edu
+  cd ~/RL-LLM
+  bash setup_gilbreth.sh
+
+Then submit job:
+  sbatch submit_training.sh
+
+================================================================================
+IMPORTANT: UPDATE YOUR ACCOUNT
+================================================================================
+
+Before submitting jobs, update the account allocation in:
+  • submit_training.sh (line 12)
+  • submit_training_a100.sh (line 12)
+
+Change from:   #SBATCH --account=pfw-cs
+To your allocation (check with: mybalance)
+
+================================================================================
+WHAT THIS TRAINS
+================================================================================
+
+Dataset:    HumanEval (20 Python code generation problems)
+Model:      Hierarchical Policy (~30M parameters)
+Algorithm:  Proximal Policy Optimization (PPO)
+Training:   1000 iterations, ~12 hours on V100, ~6 hours on A100
+Output:     Trained model checkpoints in ~/RL-LLM/checkpoints/
+
+================================================================================
+EXPECTED OUTPUT
+================================================================================
+
+After training completes, you'll have:
+  • best_model.pt           - Best performing model
+  • final_model.pt          - Final model
+  • training_history.json   - Training metrics
+  • Log files with full output
+
+Download with: bash download_results.sh <username>
+
+================================================================================
+GETTING HELP
+================================================================================
+
+Gilbreth Issues:    rcac-help@purdue.edu
+Documentation:      https://www.rcac.purdue.edu/knowledge/gilbreth
+Training Issues:    Check logs/training_error_*.txt
+
+Common Commands:
+  squeue -u $USER              - Check your jobs
+  tail -f logs/training_*.txt  - Watch training progress
+  scancel <job_id>             - Cancel a job
+  mybalance                    - Check allocations
+
+================================================================================
+QUICK REFERENCE
+================================================================================
+
+Submit job:       sbatch submit_training.sh
+Check status:     squeue -u $USER
+Monitor job:      bash monitor_training.sh <job_id>
+Cancel job:       scancel <job_id>
+Download results: bash download_results.sh <username>  (run locally)
+
+================================================================================
+
+🚀 Ready to start? Open QUICKSTART.md and follow the steps!
+
+Good luck with your training! 🎉
+
+================================================================================
