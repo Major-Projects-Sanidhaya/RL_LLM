@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import GPT2Tokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 import numpy as np
@@ -20,6 +20,15 @@ from typing import Dict, List, Tuple, Optional, Any
 from io import StringIO
 import json
 from datetime import datetime
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Import LLM reward evaluator
+try:
+    from llm_reward_evaluator import LLMRewardEvaluator, HybridRewardFunction
+    LLM_REWARDS_AVAILABLE = True
+except ImportError:
+    print("Warning: llm_reward_evaluator not found. LLM rewards will not be available.")
+    LLM_REWARDS_AVAILABLE = False
 
 # ============================================================================
 # CONFIGURATION
@@ -30,13 +39,13 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='humaneval',
                        choices=['humaneval', 'stack', 'codechain', 'redpajama'],
                        help='Dataset to use for training')
-    parser.add_argument('--num_iterations', type=int, default=8000,
+    parser.add_argument('--num_iterations', type=int, default=1000,
                        help='Number of training iterations')
     parser.add_argument('--episodes_per_iter', type=int, default=6,
                        help='Number of episodes per iteration')
-    parser.add_argument('--max_length', type=int, default=512,
+    parser.add_argument('--max_length', type=int, default=256,
                        help='Maximum sequence length')
-    parser.add_argument('--d_model', type=int, default=256,
+    parser.add_argument('--d_model', type=int, default=384,
                        help='Model dimension')
     parser.add_argument('--intention_dim', type=int, default=64,
                        help='Intention vector dimension')
@@ -54,6 +63,33 @@ def parse_args():
                        help='Logging interval')
     parser.add_argument('--subset_size', type=int, default=20,
                        help='Subset size for HumanEval dataset')
+
+    # LLM reward parameters
+    parser.add_argument('--use_llm_rewards', action='store_true',
+                       help='Use LLM for reward evaluation')
+    parser.add_argument('--llm_backend', type=str, default='ollama',
+                       choices=['ollama', 'huggingface', 'gpt', 'claude'],
+                       help='LLM backend to use (ollama/huggingface are FREE, gpt/claude are paid)')
+    parser.add_argument('--llm_model', type=str, default='llama3.2:3b',
+                       help='Model name for LLM backend')
+    parser.add_argument('--llm_device', type=str, default='cuda',
+                       choices=['cuda', 'cpu'],
+                       help='Device for HuggingFace models')
+    parser.add_argument('--ollama_url', type=str, default='http://localhost:11434',
+                       help='URL for Ollama API server')
+    parser.add_argument('--llm_weight', type=float, default=0.7,
+                       help='Weight for LLM score in final reward (0-1)')
+    parser.add_argument('--llm_threshold', type=float, default=5.0,
+                       help='Only use LLM for code with heuristic reward above this')
+    parser.add_argument('--reward_cache_dir', type=str, default='./reward_cache',
+                       help='Directory to cache LLM reward evaluations')
+
+    # Legacy support (deprecated)
+    parser.add_argument('--use_gpt', action='store_true',
+                       help='[DEPRECATED] Use --llm_backend=gpt instead')
+    parser.add_argument('--use_claude', action='store_true',
+                       help='[DEPRECATED] Use --llm_backend=claude instead')
+
     return parser.parse_args()
 
 # ============================================================================
@@ -90,56 +126,114 @@ def save_checkpoint(model, optimizer, iteration, best_reward, history, args, fil
 # ============================================================================
 
 class HumanEvalDataset:
-    """HumanEval dataset for code generation"""
+    """HumanEval dataset for code generation - manual loading without datasets library"""
 
-    def __init__(self, split: str = 'test', use_subset: Optional[int] = None):
-        print("Loading HumanEval dataset...")
-        try:
-            dataset = load_dataset("openai_humaneval", split=split)
-        except Exception as e:
-            print(f"Error loading HumanEval: {e}")
-            dataset = []
+    def __init__(self, split: str = 'test', use_subset: Optional[int] = None,
+                 use_llm_rewards: bool = False, reward_function: Optional['HybridRewardFunction'] = None):
+        print("Loading HumanEval dataset manually...")
 
+        # Download HumanEval data directly from GitHub
+        import urllib.request
+        url = "https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz"
+        cache_dir = os.path.expanduser("~/.cache/humaneval")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        cache_file = os.path.join(cache_dir, "HumanEval.jsonl.gz")
+        
+        if not os.path.exists(cache_file):
+            print(f"Downloading HumanEval from {url}...")
+            urllib.request.urlretrieve(url, cache_file)
+            print("Download complete!")
+        else:
+            print(f"Using cached HumanEval from {cache_file}")
+        
+        # Load the data
+        import gzip
         self.problems = []
-        for example in dataset:
-            problem = {
-                'task_id': example['task_id'],
-                'prompt': example['prompt'],
-                'test': example['test'],
-                'entry_point': example['entry_point']
-            }
-            self.problems.append(problem)
-
+        
+        with gzip.open(cache_file, 'rt') as f:
+            for line in f:
+                example = json.loads(line)
+                problem = {
+                    'task_id': example['task_id'],
+                    'prompt': example['prompt'],
+                    'test': example['test'],
+                    'entry_point': example['entry_point']
+                }
+                self.problems.append(problem)
+        
         if use_subset is not None:
             self.problems = self.problems[:use_subset]
 
         print(f"Loaded {len(self.problems)} code problems")
 
+        # Initialize reward function
+        self.use_llm_rewards = use_llm_rewards
+        self.reward_function = reward_function
+
+        if use_llm_rewards and reward_function:
+            print("✓ Using LLM-based reward evaluation (GPT-4 + Claude)")
+        else:
+            print("Using heuristic-based reward evaluation")
+
     def get_random_problem(self) -> Dict:
         return random.choice(self.problems)
 
     def compute_reward(self, code: str, problem: Dict) -> float:
-        """Compute reward from code execution"""
-        # Simplified reward - check for basic code structure
-        reward = 0.0
+        """Compute reward using hybrid approach (heuristics + optional LLM)"""
+        if self.use_llm_rewards and self.reward_function:
+            reward, details = self.reward_function.compute_reward(code, problem)
+            # Optionally log details for debugging
+            if random.random() < 0.05:  # Log 5% of evaluations
+                print(f"\n  Reward: {details.get('final_reward', 0):.2f}", end='')
+                if details.get('llm_used'):
+                    comp = details.get('llm_evaluation', {}).get('comprehensibility', 0)
+                    print(f" (LLM comp: {comp:.1f}/10)", end='')
+            return reward
+        else:
+            # Use improved heuristic-only
+            return self._compute_heuristic_reward(code, problem)
 
-        # Check if code contains the function definition
+    def _compute_heuristic_reward(self, code: str, problem: Dict) -> float:
+        """Improved heuristic reward (prevents reward hacking)"""
+        code = code.strip()
+        if len(code) == 0:
+            return -10.0  # Heavy penalty for empty code
+
+        reward = 2.0  # Base reward for non-empty
+
+        # Must have function definition
         if 'def ' in code:
-            reward += 2.0
+            reward += 4.0
+        else:
+            return -5.0  # No function is critical failure
 
-        # Check for return statement
+        # Should have return
         if 'return' in code:
+            reward += 3.0
+        else:
+            reward -= 1.0  # Penalty for no return
+
+        # Check length (count non-empty lines)
+        code_lines = [line for line in code.split('\n') if line.strip()]
+        num_lines = len(code_lines)
+
+        if num_lines < 1:
+            reward -= 5.0
+        elif num_lines < 3:
+            reward -= 1.0  # Too short
+        elif 3 <= num_lines <= 30:
+            reward += 2.0  # Good length
+        else:
+            reward -= 0.5  # Too long
+
+        # Check for structure
+        if ':' in code and any(kw in code for kw in ['if ', 'for ', 'while ', 'elif ']):
             reward += 2.0
 
-        # Penalize very short or very long code
-        code_lines = len(code.split('\n'))
-        if 2 <= code_lines <= 50:
-            reward += 1.0
-        elif code_lines < 2:
-            reward -= 2.0
-
-        # Check for basic Python syntax elements
-        if ':' in code and ('if' in code or 'for' in code or 'while' in code):
+        # Check for indentation (suggests actual structure)
+        indented = [line for line in code.split('\n') if line.startswith('    ') or line.startswith('\t')]
+        if len(indented) >= 2:
             reward += 1.0
 
         return reward
@@ -335,10 +429,18 @@ class HierarchicalPolicy(nn.Module):
             high_value = self.high_value(pooled)
             low_value = self.low_value(pooled)
 
+            if intention_dist is not None:
+                 intention_mean = intention_dist.mean
+                 intention_std = intention_dist.stddev
+            else:
+                 intention_mean = None
+                 intention_std = None
+
             return {
                 'logits': logits,
                 'intention': intention,
-                'intention_dist': intention_dist,
+                'intention_mean': intention_mean,
+                'intention_std': intention_std,
                 'high_value': high_value,
                 'low_value': low_value
             }
@@ -443,7 +545,8 @@ class HierarchicalPPOTrainer:
 
     def compute_hierarchical_policy_loss(self, states, actions, old_log_probs,
                                          old_intentions, advantages):
-        outputs = self.policy(states, return_intention=True)
+        model = self.policy.module if isinstance(self.policy, nn.DataParallel) else self.policy
+        outputs = model(states, return_intention=True)
 
         # Low-level policy loss
         action_dist = torch.distributions.Categorical(logits=outputs['logits'])
@@ -460,9 +563,10 @@ class HierarchicalPPOTrainer:
         token_entropy = action_dist.entropy().mean()
 
         # High-level policy loss
-        if outputs['intention_dist'] is not None:
-            old_intention_log_prob = outputs['intention_dist'].log_prob(old_intentions).sum(dim=-1)
-            intention_entropy = outputs['intention_dist'].entropy().sum(dim=-1).mean()
+        if outputs['intention_mean'] is not None:
+            intention_dist = torch.distributions.Normal(outputs['intention_mean'], outputs['intention_std'])
+            old_intention_log_prob = intention_dist.log_prob(old_intentions).sum(dim=-1)
+            intention_entropy = intention_dist.entropy().sum(dim=-1).mean()
             high_level_loss = -old_intention_log_prob.mean()
         else:
             high_level_loss = torch.tensor(0.0, device=self.device)
@@ -474,7 +578,8 @@ class HierarchicalPPOTrainer:
         return policy_loss, total_entropy, high_level_loss
 
     def compute_hierarchical_value_loss(self, states, returns):
-        outputs = self.policy(states, return_intention=True)
+        model = self.policy.module if isinstance(self.policy, nn.DataParallel) else self.policy
+        outputs = model(states, return_intention=True)
 
         high_value = outputs['high_value'].squeeze(-1)
         low_value = outputs['low_value'].squeeze(-1)
@@ -484,21 +589,30 @@ class HierarchicalPPOTrainer:
 
         return (high_value_loss + low_value_loss) / 2.0
 
-    def update(self, buffer, epochs: int = 4):
+    def update(self, buffer, epochs: int = 4, mini_batch_size: int = 1):
+        """Update policy with mini-batching to reduce memory usage"""
         batches = buffer.get_batches()
 
-        states = batches['states'].to(self.device)
-        actions = batches['actions'].to(self.device)
-        old_log_probs = batches['log_probs'].to(self.device)
-        returns = batches['returns'].to(self.device)
-        advantages = batches['advantages'].to(self.device)
+        states = batches['states']
+        actions = batches['actions']
+        old_log_probs = batches['log_probs']
+        returns = batches['returns']
+        advantages = batches['advantages']
 
+        # Get old intentions once (not in mini-batch loop)
         if 'intentions' in batches:
-            old_intentions = batches['intentions'].to(self.device)
+            old_intentions = batches['intentions']
         else:
             with torch.no_grad():
-                outputs = self.policy(states, return_intention=True)
-                old_intentions = outputs['intention']
+                # Process in chunks if needed
+                all_intentions = []
+                chunk_size = mini_batch_size
+                for i in range(0, len(states), chunk_size):
+                    chunk_states = states[i:i+chunk_size].to(self.device)
+                    model = self.policy.module if isinstance(self.policy, nn.DataParallel) else self.policy
+                    outputs = model(chunk_states, return_intention=True)
+                    all_intentions.append(outputs['intention'].cpu())
+                old_intentions = torch.cat(all_intentions, dim=0)
 
         stats = {
             'policy_loss': 0.0,
@@ -507,23 +621,45 @@ class HierarchicalPPOTrainer:
             'intention_loss': 0.0
         }
 
+        batch_size = len(states)
+        num_mini_batches = max(1, (batch_size + mini_batch_size - 1) // mini_batch_size)
+
         for epoch in range(epochs):
-            policy_loss, entropy, intention_loss = self.compute_hierarchical_policy_loss(
-                states, actions, old_log_probs, old_intentions, advantages
-            )
-            value_loss = self.compute_hierarchical_value_loss(states, returns)
+            # Process in mini-batches
+            for i in range(0, batch_size, mini_batch_size):
+                end_idx = min(i + mini_batch_size, batch_size)
 
-            total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                # Move mini-batch to device
+                batch_states = states[i:end_idx].to(self.device)
+                batch_actions = actions[i:end_idx].to(self.device)
+                batch_old_log_probs = old_log_probs[i:end_idx].to(self.device)
+                batch_old_intentions = old_intentions[i:end_idx].to(self.device)
+                batch_advantages = advantages[i:end_idx].to(self.device)
+                batch_returns = returns[i:end_idx].to(self.device)
 
-            self.optimizer.zero_grad()
-            total_loss.backward()
+                # Compute losses
+                policy_loss, entropy, intention_loss = self.compute_hierarchical_policy_loss(
+                    batch_states, batch_actions, batch_old_log_probs, batch_old_intentions, batch_advantages
+                )
+                value_loss = self.compute_hierarchical_value_loss(batch_states, batch_returns)
+
+                total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                # Scale loss for gradient accumulation
+                total_loss = total_loss / num_mini_batches
+
+                # Backward pass (accumulate gradients)
+                total_loss.backward()
+
+                stats['policy_loss'] += policy_loss.item() / num_mini_batches
+                stats['value_loss'] += value_loss.item() / num_mini_batches
+                stats['entropy'] += entropy.item() / num_mini_batches
+                stats['intention_loss'] += intention_loss.item() / num_mini_batches
+
+            # Update weights after all mini-batches
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.optimizer.step()
-
-            stats['policy_loss'] += policy_loss.item()
-            stats['value_loss'] += value_loss.item()
-            stats['entropy'] += entropy.item()
-            stats['intention_loss'] += intention_loss.item()
+            self.optimizer.zero_grad()
 
         for key in stats:
             stats[key] /= epochs
@@ -540,7 +676,8 @@ class HierarchicalPPOTrainer:
             token_ids = state['token_ids'].unsqueeze(0).to(self.device)
 
             with torch.no_grad():
-                outputs = self.policy(token_ids, return_intention=True)
+                model = self.policy.module if isinstance(self.policy, nn.DataParallel) else self.policy
+                outputs = model(token_ids,return_intention = True)
                 action_dist = torch.distributions.Categorical(logits=outputs['logits'])
                 action = action_dist.sample()
                 log_prob = action_dist.log_prob(action)
@@ -587,21 +724,74 @@ def main():
     print(f"Iterations: {args.num_iterations}")
     print(f"Episodes per iteration: {args.episodes_per_iter}")
     print(f"Max sequence length: {args.max_length}")
+    print(f"LLM Rewards: {args.use_llm_rewards}")
+    if args.use_llm_rewards:
+        # Handle legacy arguments
+        if args.use_gpt:
+            print("  Warning: --use_gpt is deprecated. Use --llm_backend=gpt instead")
+            args.llm_backend = 'gpt'
+            if not args.llm_model or args.llm_model == 'llama3.2:3b':
+                args.llm_model = 'gpt-4o-mini'
+        if args.use_claude:
+            print("  Warning: --use_claude is deprecated. Use --llm_backend=claude instead")
+            args.llm_backend = 'claude'
+            if not args.llm_model or args.llm_model == 'llama3.2:3b':
+                args.llm_model = 'claude-3-5-haiku-20241022'
+
+        print(f"  Backend: {args.llm_backend}")
+        print(f"  Model: {args.llm_model}")
+        print(f"  LLM Weight: {args.llm_weight}")
+        if args.llm_backend == 'ollama':
+            print(f"  Ollama URL: {args.ollama_url}")
+        elif args.llm_backend == 'huggingface':
+            print(f"  Device: {args.llm_device}")
     print("=" * 70)
     print()
 
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
+    # Initialize LLM reward evaluator if requested
+    reward_function = None
+    if args.use_llm_rewards:
+        if not LLM_REWARDS_AVAILABLE:
+            print("ERROR: LLM rewards requested but llm_reward_evaluator not available!")
+            print("Make sure llm_reward_evaluator.py is in the same directory.")
+            sys.exit(1)
+
+        print("Initializing LLM reward evaluator...")
+        try:
+            llm_evaluator = LLMRewardEvaluator(
+                llm_backend=args.llm_backend,
+                model_name=args.llm_model,
+                cache_dir=args.reward_cache_dir,
+                device=args.llm_device,
+                ollama_url=args.ollama_url
+            )
+            reward_function = HybridRewardFunction(
+                llm_evaluator=llm_evaluator,
+                use_llm_threshold=args.llm_threshold,
+                llm_weight=args.llm_weight
+            )
+            print("✓ LLM reward evaluator initialized")
+        except Exception as e:
+            print(f"ERROR initializing LLM evaluator: {e}")
+            print("Falling back to heuristic rewards only")
+            args.use_llm_rewards = False
+
     # Load tokenizer
     print("Loading tokenizer...")
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Create dataset
+    # Create dataset with LLM rewards
     print(f"Creating {args.dataset} dataset...")
     if args.dataset == 'humaneval':
-        dataset = HumanEvalDataset(use_subset=args.subset_size)
+        dataset = HumanEvalDataset(
+            use_subset=args.subset_size,
+            use_llm_rewards=args.use_llm_rewards,
+            reward_function=reward_function
+        )
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not yet implemented in standalone script")
 
@@ -627,6 +817,10 @@ def main():
         nhead=args.nhead,
         max_len=args.max_length
     ).to(device)
+
+    if torch.cuda.device_count() > 1:
+       print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+       policy = nn.DataParallel(policy)
 
     print(f"Policy created with {sum(p.numel() for p in policy.parameters()):,} parameters")
 
@@ -660,7 +854,7 @@ def main():
 
         # Update policy
         if len(buffer) > 0:
-            stats = trainer.update(buffer, epochs=4)
+            stats = trainer.update(buffer, epochs=4, mini_batch_size=1)
         else:
             stats = {}
 
@@ -687,7 +881,8 @@ def main():
             while not done and steps < 100:
                 token_ids = state['token_ids'].unsqueeze(0).to(device)
                 with torch.no_grad():
-                    outputs = policy(token_ids, return_intention=True)
+                    model = policy.module if isinstance(policy, nn.DataParallel) else policy
+                    outputs = model(token_ids, return_intention=True)
                     action_dist = torch.distributions.Categorical(logits=outputs['logits'])
                     action = action_dist.sample()
                 state, _, done, info = env.step(action.item())
