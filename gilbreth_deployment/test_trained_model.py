@@ -254,28 +254,36 @@ class ModelTester:
         self.device = device
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+
         # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        
+
         # Get model args
         args = checkpoint.get('args', {})
         self.model_args = args
-        
+
         # Create model
         self.policy = HierarchicalPolicy(
             vocab_size=self.tokenizer.vocab_size,
-            d_model=args.get('d_model', 256),
+            d_model=args.get('d_model', 384),  # Match your training default
             intention_dim=args.get('intention_dim', 64),
             num_layers=args.get('num_layers', 4),
             nhead=args.get('nhead', 4),
-            max_len=args.get('max_length', 256)
+            max_len=args.get('max_length', 512)  # Match your training default
         ).to(device)
+
+        # Load state dict with DataParallel handling
+        state_dict = checkpoint['model_state_dict']
         
-        self.policy.load_state_dict(checkpoint['model_state_dict'])
+        # Remove 'module.' prefix if present (from DataParallel)
+        if list(state_dict.keys())[0].startswith('module.'):
+            print("  Detected DataParallel checkpoint, removing 'module.' prefix...")
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        self.policy.load_state_dict(state_dict)
         self.policy.eval()
-        
+
         print(f"✓ Model loaded (iteration {checkpoint.get('iteration', 'unknown')})")
         print(f"  Best training reward: {checkpoint.get('best_reward', 'unknown')}")
         print(f"  Parameters: {sum(p.numel() for p in self.policy.parameters()):,}")
