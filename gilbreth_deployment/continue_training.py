@@ -31,6 +31,46 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+def resolve_checkpoint_path(args) -> str:
+    """
+    Resolve which checkpoint to load:
+
+    Priority:
+      1. Explicit --checkpoint path, if it exists
+      2. best_model.pt in args.checkpoint_dir (e.g. ./checkpoints_continued)
+      3. best_model.pt in ./checkpoints (original training dir)
+
+    Raises if nothing is found.
+    """
+    # 1) Explicit path
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        return args.checkpoint
+
+    candidates = []
+
+    # 2) best_model.pt in continuation dir (if it exists)
+    if args.checkpoint_dir:
+        cont_best = os.path.join(args.checkpoint_dir, "best_model.pt")
+        if os.path.exists(cont_best):
+            candidates.append(cont_best)
+
+    # 3) Original training dir ./checkpoints/best_model.pt
+    base_best = os.path.join("./checkpoints", "best_model.pt")
+    if os.path.exists(base_best):
+        candidates.append(base_best)
+
+    if not candidates:
+        raise FileNotFoundError(
+            "No checkpoint found. Tried:\n"
+            f"  explicit --checkpoint={args.checkpoint}\n"
+            f"  {os.path.join(args.checkpoint_dir, 'best_model.pt') if args.checkpoint_dir else ''}\n"
+            "  ./checkpoints/best_model.pt"
+        )
+
+    # Pick the most recently modified best_model.pt
+    best = max(candidates, key=os.path.getmtime)
+    print(f"Resolved checkpoint to: {best}")
+    return best
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Continue training on new dataset')
@@ -49,7 +89,8 @@ def parse_args():
                         help='Path to custom dataset (JSON format)')
     parser.add_argument('--subset_size', type=int, default=100,
                         help='Subset size for training')
-    
+    parser.add_argument('--checkpoint', type=str, default=None,
+                    help='Path to pre-trained checkpoint (default: latest best_model.pt)')
     # Training hyperparameters
     parser.add_argument('--num_iterations', type=int, default=500,
                         help='Number of training iterations')
@@ -724,11 +765,14 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     
     # Load checkpoint
-    print(f"\nLoading checkpoint from {args.checkpoint}...")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    ckpt_path = resolve_checkpoint_path(args)
+
+    # Load checkpoint
+    print(f"\nLoading checkpoint from {ckpt_path}...")
+    checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = checkpoint.get('args', {})
-    
-    # Create model
+
+    # Create model with the same hyperparameters used in training
     policy = HierarchicalPolicy(
         vocab_size=tokenizer.vocab_size,
         d_model=model_args.get('d_model', 256),
@@ -737,8 +781,14 @@ def main():
         nhead=model_args.get('nhead', 4),
         max_len=args.max_length
     ).to(device)
-    
-    policy.load_state_dict(checkpoint['model_state_dict'])
+
+    # Handle DataParallel checkpoints (module.* keys)
+    state_dict = checkpoint['model_state_dict']
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        print("  Detected DataParallel checkpoint, stripping 'module.' prefix...")
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    policy.load_state_dict(state_dict)
     print(f"✓ Loaded model from iteration {checkpoint.get('iteration', 'unknown')}")
     print(f"  Previous best reward: {checkpoint.get('best_reward', 'unknown')}")
     
