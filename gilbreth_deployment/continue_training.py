@@ -302,10 +302,11 @@ class MBPPDataset:
             reward += 1.0
         
         # Syntax validity bonus
+        clean_code = code.replace('\x00', '')
         try:
-            compile(code, '<string>', 'exec')
-            reward += 2.0  # Bonus for valid syntax
-        except SyntaxError:
+            compile(clean_code, '<string>', 'exec')
+            reward += 3.5  # Bonus for valid syntax
+        except( SyntaxError, ValueError):
             reward -= 1.0
         
         return reward
@@ -362,10 +363,11 @@ class APPSDataset:
             reward += 1.0
         if ':' in code and ('if' in code or 'for' in code or 'while' in code):
             reward += 1.0
+        clean_code = code.replace('\x00', '')
         try:
-            compile(code, '<string>', 'exec')
-            reward += 2.0
-        except SyntaxError:
+            compile(clean_code, '<string>', 'exec')
+            reward += 3.5  # Bonus for valid syntax
+        except( SyntaxError, ValueError):
             reward -= 1.0
         return reward
 
@@ -415,11 +417,11 @@ class CodeSearchNetDataset:
         if 1 <= code_lines <= 30:
             reward += 1.0
         try:
-            # Try to compile the generated body
-            test_code = "def test():\n" + "\n".join("    " + line for line in code.split('\n'))
+            clean_body = code.replace('\x00', '')
+            test_code = "def test():\n" + "\n".join("    " + line for line in clean_body.split('\n'))
             compile(test_code, '<string>', 'exec')
             reward += 3.0
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             reward -= 1.0
         return reward
 
@@ -461,11 +463,12 @@ class CustomDataset:
         code_lines = len(code.split('\n'))
         if 2 <= code_lines <= 50:
             reward += 1.0
+        clean_code = code.replace('\x00', '')
         try:
-            compile(code, '<string>', 'exec')
-            reward += 2.0
-        except SyntaxError:
-            pass
+            compile(clean_code, '<string>', 'exec')
+            reward += 3.5  # Bonus for valid syntax
+        except( SyntaxError, ValueError):
+            reward -= 1.0
         return reward
 
     def __len__(self):
@@ -521,9 +524,10 @@ class CodeGenerationEnvironment:
             # Execution bonus
             try:
                 full_code = self.current_problem['prompt'] + generated_code
+                full_code = full_code.replace('\x00', '')
                 compile(full_code, '<string>', 'exec')
                 reward += self.execution_bonus
-            except:
+            except Exception:
                 pass
         else:
             reward = -0.01
