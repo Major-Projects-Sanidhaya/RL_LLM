@@ -4,7 +4,7 @@
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/continue_output_%j.txt
 #SBATCH --error=logs/continue_error_%j.txt
 
@@ -21,19 +21,15 @@ echo "Started: $(date)"
 echo "=============================================="
 
 # Load modules
-module purge
+module load rcac
+module load anaconda/2025.06-py313
 module load cuda/12.1.1
-module load python/3.11.5
 
-# Use virtual environment
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python -m venv venv
-fi
+# Initialize conda
+eval "$(conda shell.bash hook)"
 
-source venv/bin/activate
-pip install --upgrade pip -q
-pip install torch transformers datasets tqdm numpy -q
+# Activate conda environment
+conda activate rl_llm_env
 
 # Create directories
 mkdir -p logs checkpoints_continued results

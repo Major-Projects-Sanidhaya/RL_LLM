@@ -76,8 +76,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Continue training on new dataset')
     
     # Checkpoint loading
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_model.pt',
-                        help='Path to pre-trained checkpoint')
+    
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from checkpoint (vs. fine-tune)')
     
@@ -94,9 +93,9 @@ def parse_args():
     # Training hyperparameters
     parser.add_argument('--num_iterations', type=int, default=500,
                         help='Number of training iterations')
-    parser.add_argument('--episodes_per_iter', type=int, default=6,
+    parser.add_argument('--episodes_per_iter', type=int, default=4,
                         help='Episodes per iteration')
-    parser.add_argument('--max_length', type=int, default=256,
+    parser.add_argument('--max_length', type=int, default=128,
                         help='Maximum sequence length')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate (lower for fine-tuning)')
@@ -617,12 +616,13 @@ class RolloutBuffer:
 class HierarchicalPPOTrainer:
     def __init__(self, policy, lr: float = 1e-4, clip_ratio: float = 0.2,
                  value_coef: float = 0.5, entropy_coef: float = 0.01,
-                 intention_coef: float = 0.1):
+                 intention_coef: float = 0.1, mini_batch_size: int = 32):
         self.policy = policy
         self.clip_ratio = clip_ratio
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.intention_coef = intention_coef
+        self.mini_batch_size = mini_batch_size
         self.optimizer = optim.Adam(
             filter(lambda p: p.requires_grad, policy.parameters()), 
             lr=lr
@@ -673,39 +673,67 @@ class HierarchicalPPOTrainer:
         old_log_probs = batches['log_probs'].to(self.device)
         returns = batches['returns'].to(self.device)
         advantages = batches['advantages'].to(self.device)
-        
+
         if 'intentions' in batches:
             old_intentions = batches['intentions'].to(self.device)
         else:
             with torch.no_grad():
                 outputs = self.policy(states, return_intention=True)
                 old_intentions = outputs['intention']
-        
+
+        num_samples = states.size(0)
         stats = {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'intention_loss': 0.0}
-        
+
         for epoch in range(epochs):
-            policy_loss, entropy, intention_loss = self.compute_hierarchical_policy_loss(
-                states, actions, old_log_probs, old_intentions, advantages
-            )
-            value_loss = self.compute_hierarchical_value_loss(states, returns)
-            total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
-            
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-            self.optimizer.step()
-            
-            stats['policy_loss'] += policy_loss.item()
-            stats['value_loss'] += value_loss.item()
-            stats['entropy'] += entropy.item()
-            stats['intention_loss'] += intention_loss.item()
-        
-        for key in stats:
-            stats[key] /= epochs
-        
+            perm = torch.randperm(num_samples, device=self.device)
+            epoch_policy_loss = 0.0
+            epoch_value_loss = 0.0
+            epoch_entropy = 0.0
+            epoch_intention_loss = 0.0
+            num_minibatches = 0
+
+            for start in range(0, num_samples, self.mini_batch_size):
+                end = start + self.mini_batch_size
+                idx = perm[start:end]
+
+                mb_states = states[idx]
+                mb_actions = actions[idx]
+                mb_old_log_probs = old_log_probs[idx]
+                mb_returns = returns[idx]
+                mb_advantages = advantages[idx]
+                mb_old_intentions = old_intentions[idx]
+
+                policy_loss, entropy, intention_loss = self.compute_hierarchical_policy_loss(
+                    mb_states, mb_actions, mb_old_log_probs, mb_old_intentions, mb_advantages
+                )
+                value_loss = self.compute_hierarchical_value_loss(mb_states, mb_returns)
+                total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
+
+                epoch_policy_loss += policy_loss.item()
+                epoch_value_loss += value_loss.item()
+                epoch_entropy += entropy.item()
+                epoch_intention_loss += intention_loss.item()
+                num_minibatches += 1
+
+                # Optional: free memory between minibatches
+                del mb_states, mb_actions, mb_old_log_probs, mb_returns, mb_advantages, mb_old_intentions
+                torch.cuda.empty_cache()
+
+            # Average over minibatches
+            if num_minibatches > 0:
+                stats['policy_loss'] = epoch_policy_loss / num_minibatches
+                stats['value_loss'] = epoch_value_loss / num_minibatches
+                stats['entropy'] = epoch_entropy / num_minibatches
+                stats['intention_loss'] = epoch_intention_loss / num_minibatches
+
         if self.scheduler:
             self.scheduler.step()
-        
+
         return stats
 
     def collect_episode_with_intentions(self, env, buffer, max_steps: int = 100):
@@ -772,6 +800,8 @@ def main():
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = checkpoint.get('args', {})
 
+    saved_max_len = model_args.get('max_length', 256)
+
     # Create model with the same hyperparameters used in training
     policy = HierarchicalPolicy(
         vocab_size=tokenizer.vocab_size,
@@ -779,7 +809,7 @@ def main():
         intention_dim=model_args.get('intention_dim', 64),
         num_layers=model_args.get('num_layers', 4),
         nhead=model_args.get('nhead', 4),
-        max_len=args.max_length
+        max_len=saved_max_len
     ).to(device)
 
     # Handle DataParallel checkpoints (module.* keys)
@@ -821,7 +851,7 @@ def main():
     )
     
     # Create trainer
-    trainer = HierarchicalPPOTrainer(policy, lr=args.lr)
+    trainer = HierarchicalPPOTrainer(policy, lr=args.lr, mini_batch_size=16)
     trainer.set_lr_scheduler(args.warmup_steps, args.lr_decay)
     
     # Optionally load optimizer state
@@ -848,9 +878,11 @@ def main():
             episode_rewards.append(reward)
         
         if len(buffer) > 0:
-            stats = trainer.update(buffer, epochs=4)
+            stats = trainer.update(buffer, epochs=2)
         else:
             stats = {}
+
+        torch.cuda.empty_cache()
         
         avg_reward = sum(episode_rewards) / len(episode_rewards)
         training_history.append(avg_reward)
