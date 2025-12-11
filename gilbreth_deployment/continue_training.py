@@ -29,6 +29,165 @@ from typing import Dict, List, Tuple, Optional
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ============================================================================
+# GLOBAL REWARD FUNCTION
+# ============================================================================
+
+# ============================================================================
+# LLM-BASED REWARD SCORER (Optional Enhancement)
+# ============================================================================
+
+class LLMRewardScorer:
+    """
+    Uses a small LLM to score code quality.
+    Caches model to avoid reloading.
+    """
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        
+        print("Loading LLM reward scorer (SmolLM2-360M)...")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        model_name = "HuggingFaceTB/SmolLM2-360M-Instruct"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        )
+        self.model.to(device)
+        self.model.eval()
+        self.device = device
+        self._initialized = True
+        print("✓ LLM scorer loaded")
+    
+    def score_code(self, code: str, prompt: str = "") -> float:
+        """
+        Score code quality using LLM judgment.
+        Returns: -10.0 to +10.0
+        """
+        # Create scoring prompt
+        scoring_prompt = f"""Rate this Python code quality from 0-10:
+
+Prompt: {prompt[:100]}
+
+Code:
+{code[:300]}
+
+Score (0-10, just the number):"""
+        
+        inputs = self.tokenizer(scoring_prompt, return_tensors="pt").to(self.device)        
+        with torch.no_grad():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=5,
+                temperature=0.1,
+                do_sample=False
+            )
+        
+        response = self.tokenizer.decode(output[0], skip_special_tokens=True)
+        
+        # Extract score (look for number 0-10)
+        import re
+        match = re.search(r'(\d+(?:\.\d+)?)', response.split("Score")[-1])
+        if match:
+            score = float(match.group(1))
+            # Normalize to -10 to +10 range
+            return (score - 5.0) * 2.0
+        
+        return 0.0  # Default if parsing fails
+
+
+# Global LLM scorer instance (lazy loaded)
+_llm_scorer = None
+
+def get_llm_scorer():
+    """Lazy load LLM scorer"""
+    global _llm_scorer
+    if _llm_scorer is None:
+        _llm_scorer = LLMRewardScorer()
+    return _llm_scorer
+
+def compute_heuristic_reward(code: str, prompt: str = "", use_llm: bool = False) -> float:
+    """
+    Enhanced reward function for code generation.
+    Strongly encourages valid Python structure.
+    
+    Args:
+        code: Generated code
+        prompt: Original problem prompt (for LLM context)
+        use_llm: Whether to use LLM scoring (slower but more accurate)
+    """
+    reward = 0.0
+    
+    # Remove null bytes for compilation
+    clean_code = code.replace('\x00', '')
+    
+    # 1. STRONG function definition bonus (look early in code)
+    if "def " in code[:100]:
+        reward += 10.0
+    else:
+        reward -= 5.0  # Penalize missing def
+    
+    # 2. STRONG return statement bonus
+    if "return " in code:
+        reward += 8.0
+    else:
+        reward -= 3.0  # Penalize missing return
+    
+    # 3. Length-based reward (force reasonable code length)
+    lines = [l for l in clean_code.strip().split('\n') if l.strip()]
+    num_lines = len(lines)
+    
+    if 4 <= num_lines <= 25:
+        reward += 5.0
+    elif num_lines < 4:
+        reward -= 10.0  # HARSH penalty for tiny code
+    elif num_lines > 50:
+        reward -= 2.0
+    
+    # 4. Control flow bonus (if/for/while/elif)
+    control_keywords = ['if ', 'for ', 'while ', 'elif ']
+    control_count = sum(1 for kw in control_keywords if kw in code)
+    reward += control_count * 3.0
+    
+    # 5. Indentation bonus (proper Python structure)
+    indented_lines = sum(1 for line in lines if line.startswith('    ') or line.startswith('\t'))
+    if indented_lines > 0:
+        reward += 2.0
+    
+    # 6. PENALIZE gibberish heavily
+    # Count non-ASCII or weird characters
+    gibberish_chars = sum(1 for c in code if ord(c) > 127 or c in '↑→─┬┘└┌┐│')
+    if gibberish_chars > len(code) * 0.05:  # >5% garbage
+        reward -= 15.0
+    
+    # 7. Syntax validity (BIGGEST bonus)
+    try:
+        compile(clean_code, '<string>', 'exec')
+        reward += 12.0  # HUGE bonus for valid syntax
+    except (SyntaxError, ValueError):
+        reward -= 5.0  # Penalty for invalid syntax
+    
+    # 8. LLM-based quality score (optional, slower)
+    if use_llm and len(clean_code) > 10:
+        try:
+            llm_score = get_llm_scorer().score_code(code, prompt)
+            reward += llm_score * 0.5  # Weight LLM score at 50%
+        except Exception as e:
+            print(f"LLM scoring failed: {e}")
+    
+    return reward
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 def resolve_checkpoint_path(args) -> str:
@@ -74,6 +233,9 @@ def resolve_checkpoint_path(args) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Continue training on new dataset')
+
+    parser.add_argument('--use_llm_reward', action='store_true',
+                    help='Use LLM-based reward scoring (slower but more accurate)')
     
     # Checkpoint loading
     
@@ -91,9 +253,9 @@ def parse_args():
     parser.add_argument('--checkpoint', type=str, default=None,
                     help='Path to pre-trained checkpoint (default: latest best_model.pt)')
     # Training hyperparameters
-    parser.add_argument('--num_iterations', type=int, default=500,
+    parser.add_argument('--num_iterations', type=int, default=4,
                         help='Number of training iterations')
-    parser.add_argument('--episodes_per_iter', type=int, default=4,
+    parser.add_argument('--episodes_per_iter', type=int, default=32,
                         help='Episodes per iteration')
     parser.add_argument('--max_length', type=int, default=128,
                         help='Maximum sequence length')
@@ -281,35 +443,11 @@ class MBPPDataset:
         return random.choice(self.problems)
 
     def compute_reward(self, code: str, problem: Dict) -> float:
-        """Enhanced reward function for MBPP"""
-        reward = 0.0
-        
-        # Basic structure rewards
-        if 'def ' in code:
-            reward += 2.0
-        if 'return' in code:
-            reward += 2.0
-        
-        # Length-based reward
-        code_lines = len(code.split('\n'))
-        if 2 <= code_lines <= 50:
-            reward += 1.0
-        elif code_lines < 2:
-            reward -= 2.0
-        
-        # Control flow bonus
-        if ':' in code and ('if' in code or 'for' in code or 'while' in code):
-            reward += 1.0
-        
-        # Syntax validity bonus
-        clean_code = code.replace('\x00', '')
-        try:
-            compile(clean_code, '<string>', 'exec')
-            reward += 3.5  # Bonus for valid syntax
-        except( SyntaxError, ValueError):
-            reward -= 1.0
-        
-        return reward
+        return compute_heuristic_reward(
+            code, 
+            prompt=problem.get('prompt', ''),
+            use_llm=True  # Enable LLM scoring
+        )
 
     def __len__(self):
         return len(self.problems)
@@ -353,23 +491,12 @@ class APPSDataset:
         return random.choice(self.problems)
 
     def compute_reward(self, code: str, problem: Dict) -> float:
-        reward = 0.0
-        if 'def ' in code:
-            reward += 2.0
-        if 'return' in code:
-            reward += 2.0
-        code_lines = len(code.split('\n'))
-        if 2 <= code_lines <= 50:
-            reward += 1.0
-        if ':' in code and ('if' in code or 'for' in code or 'while' in code):
-            reward += 1.0
-        clean_code = code.replace('\x00', '')
-        try:
-            compile(clean_code, '<string>', 'exec')
-            reward += 3.5  # Bonus for valid syntax
-        except( SyntaxError, ValueError):
-            reward -= 1.0
-        return reward
+        """Use global reward function with LLM scoring"""
+        return compute_heuristic_reward(
+            code,
+            prompt=problem.get('prompt', ''),
+            use_llm=True
+        )
 
     def __len__(self):
         return len(self.problems)
@@ -410,20 +537,12 @@ class CodeSearchNetDataset:
         return random.choice(self.problems)
 
     def compute_reward(self, code: str, problem: Dict) -> float:
-        reward = 0.0
-        if 'return' in code:
-            reward += 2.0
-        code_lines = len(code.split('\n'))
-        if 1 <= code_lines <= 30:
-            reward += 1.0
-        try:
-            clean_body = code.replace('\x00', '')
-            test_code = "def test():\n" + "\n".join("    " + line for line in clean_body.split('\n'))
-            compile(test_code, '<string>', 'exec')
-            reward += 3.0
-        except (SyntaxError, ValueError):
-            reward -= 1.0
-        return reward
+        """Use global reward function with LLM scoring"""
+        return compute_heuristic_reward(
+            code,
+            prompt=problem.get('prompt', ''),
+            use_llm=True
+        )
 
     def __len__(self):
         return len(self.problems)
@@ -455,21 +574,12 @@ class CustomDataset:
         return random.choice(self.problems)
 
     def compute_reward(self, code: str, problem: Dict) -> float:
-        reward = 0.0
-        if 'def ' in code:
-            reward += 2.0
-        if 'return' in code:
-            reward += 2.0
-        code_lines = len(code.split('\n'))
-        if 2 <= code_lines <= 50:
-            reward += 1.0
-        clean_code = code.replace('\x00', '')
-        try:
-            compile(clean_code, '<string>', 'exec')
-            reward += 3.5  # Bonus for valid syntax
-        except( SyntaxError, ValueError):
-            reward -= 1.0
-        return reward
+        """Use global reward function with LLM scoring"""
+        return compute_heuristic_reward(
+            code,
+            prompt=problem.get('prompt', ''),
+            use_llm=True
+        )
 
     def __len__(self):
         return len(self.problems)
@@ -530,7 +640,7 @@ class CodeGenerationEnvironment:
             except Exception:
                 pass
         else:
-            reward = -0.01
+            reward = -0.001
         
         next_state = self.get_state()
         info = {
@@ -619,7 +729,7 @@ class RolloutBuffer:
 
 class HierarchicalPPOTrainer:
     def __init__(self, policy, lr: float = 1e-4, clip_ratio: float = 0.2,
-                 value_coef: float = 0.5, entropy_coef: float = 0.01,
+                 value_coef: float = 0.5, entropy_coef: float = 0.03,
                  intention_coef: float = 0.1, mini_batch_size: int = 32):
         self.policy = policy
         self.clip_ratio = clip_ratio
@@ -844,6 +954,7 @@ def main():
         dataset = CustomDataset(args.custom_data_path, use_subset=args.subset_size)
     
     print(f"Dataset size: {len(dataset)}")
+    dataset.use_llm_reward = args.use_llm_reward
     
     # Create environment
     env = CodeGenerationEnvironment(

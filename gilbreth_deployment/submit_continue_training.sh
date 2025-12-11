@@ -20,6 +20,11 @@ echo "Node: $SLURMD_NODENAME"
 echo "Started: $(date)"
 echo "=============================================="
 
+# Set pip to install in scratch (avoid home directory quota)
+export PIP_CACHE_DIR=/scratch/gilbreth/$USER/pip_cache
+export TMPDIR=/scratch/gilbreth/$USER/tmp
+mkdir -p $PIP_CACHE_DIR $TMPDIR
+
 # Load modules
 module load rcac
 module load anaconda/2025.06-py313
